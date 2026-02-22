@@ -25,6 +25,9 @@ plt.rcParams["axes.unicode_minus"] = False
 ADMIN_USER = "admin"
 ADMIN_PWD = "Admin123@"
 
+# 定义5个销售人员录入项的默认标识
+SALES_STAFF_ITEMS = ["销售人员1", "销售人员2", "销售人员3", "销售人员4", "销售人员5"]
+
 # ======================== 数据库管理（修复Streamlit Cloud兼容问题） ========================
 # 确保数据库文件路径可写
 DB_PATH = os.path.join(os.getcwd(), 'flight_sales.db')
@@ -121,6 +124,55 @@ def format_amount(amount):
 def format_rate(rate):
     return f"{rate:.1%}" if rate else "0.0%"
 
+# 新增：根据姓名获取销售人员ID（无则自动创建临时账号）
+def get_staff_id_by_name(staff_name):
+    if not staff_name:
+        return None, "姓名不能为空"
+    
+    conn = DBManager.get_conn()
+    if conn is None:
+        return None, "数据库连接失败"
+    
+    try:
+        # 先查询是否存在该姓名的销售人员
+        c = conn.cursor()
+        c.execute("SELECT id FROM sales_staff WHERE real_name = ? AND is_admin = 0", (staff_name,))
+        staff = c.fetchone()
+        
+        if staff:
+            return staff[0], "查询成功"
+        else:
+            # 自动创建临时账号（用户名=姓名，密码=默认123456A）
+            temp_username = staff_name.replace(" ", "")
+            temp_password = "123456A"
+            pwd_hash = generate_password_hash(temp_password, method='pbkdf2:sha256')
+            
+            c.execute(
+                "INSERT INTO sales_staff (username, password_hash, real_name, is_admin) VALUES (?, ?, ?, 0)",
+                (temp_username, pwd_hash, staff_name)
+            )
+            conn.commit()
+            return c.lastrowid, f"自动创建账号：{temp_username} / {temp_password}"
+    except sqlite3.IntegrityError:
+        # 用户名重复则拼接数字
+        temp_username = staff_name.replace(" ", "") + "_1"
+        temp_password = "123456A"
+        pwd_hash = generate_password_hash(temp_password, method='pbkdf2:sha256')
+        
+        c.execute(
+            "INSERT INTO sales_staff (username, password_hash, real_name, is_admin) VALUES (?, ?, ?, 0)",
+            (temp_username, pwd_hash, staff_name)
+        )
+        conn.commit()
+        return c.lastrowid, f"自动创建账号：{temp_username} / {temp_password}"
+    except Exception as e:
+        st.error(f"获取销售人员ID失败：{str(e)}")
+        conn.rollback()
+        return None, f"系统异常：{str(e)}"
+    finally:
+        conn.close()
+        DBManager._conn = None
+
 # ======================== 业务逻辑（增加异常处理） ========================
 # 登录
 def login(username, password):
@@ -187,7 +239,58 @@ def register(username, password, real_name):
         conn.close()
         DBManager._conn = None
 
-# 新增航班销售数据
+# 新增：批量添加5个销售人员的销售数据
+def add_batch_flight_sales(sales_data_list):
+    conn = DBManager.get_conn()
+    if conn is None:
+        return False, "数据库连接失败"
+    
+    try:
+        c = conn.cursor()
+        success_count = 0
+        fail_messages = []
+        
+        for data in sales_data_list:
+            staff_name = data.get("staff_name")
+            flight_no = data.get("flight_no")
+            sale_date = data.get("sale_date")
+            sale_amount = data.get("sale_amount")
+            sale_target = data.get("sale_target")
+            
+            # 跳过空数据
+            if not staff_name or not flight_no or sale_amount <= 0 or sale_target <= 0:
+                continue
+            
+            # 获取/创建销售人员ID
+            staff_id, msg = get_staff_id_by_name(staff_name)
+            if staff_id is None:
+                fail_messages.append(f"{staff_name}：{msg}")
+                continue
+            
+            # 计算完成率
+            completion_rate = sale_amount / sale_target if sale_target > 0 else 0
+            
+            # 插入数据
+            c.execute(
+                "INSERT INTO flight_sales (staff_id, staff_name, flight_no, sale_date, sale_amount, sale_target, completion_rate) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (staff_id, staff_name, flight_no, str(sale_date), sale_amount, sale_target, completion_rate)
+            )
+            success_count += 1
+        
+        conn.commit()
+        if success_count > 0:
+            return True, f"成功录入{success_count}条数据！{('失败：' + '; '.join(fail_messages)) if fail_messages else ''}"
+        else:
+            return False, f"无有效数据录入！{('失败：' + '; '.join(fail_messages)) if fail_messages else '请填写姓名、航班号，且销售额/指标大于0'}"
+    except Exception as e:
+        st.error(f"批量录入失败：{str(e)}")
+        conn.rollback()
+        return False, f"系统异常：{str(e)}"
+    finally:
+        conn.close()
+        DBManager._conn = None
+
+# 新增航班销售数据（单个）
 def add_flight_sale(staff_id, staff_name, flight_no, sale_date, sale_amount, sale_target):
     if sale_amount <= 0 or sale_target <= 0:
         return False, "销售额和销售指标必须大于0"
@@ -574,168 +677,86 @@ if st.session_state.user is None:
                         st.error(msg)
     st.stop()
 
-# ======================== 普通销售人员页面 ========================
-if not st.session_state.user["is_admin"]:
-    st.title(f"✈️ {st.session_state.user['real_name']} 的销售看板")
-    
-    # 退出按钮
-    col_logout, _ = st.columns([1, 9])
-    with col_logout:
-        if st.button("🚪 退出登录"):
-            st.session_state.clear()
-            st.rerun()
-    
-    # 1. 数据筛选
-    st.subheader("📅 数据筛选")
-    col1, col2 = st.columns(2)
-    with col1:
-        start_date = st.date_input("开始日期", datetime.now() - timedelta(days=30))
-    with col2:
-        end_date = st.date_input("结束日期", datetime.now())
-    
-    # 2. 获取个人销售数据
-    df_staff = get_staff_sales(st.session_state.user["id"], start_date, end_date)
-    
-    # 3. 个人核心统计
-    if not df_staff.empty:
-        total_amount = df_staff["sale_amount"].sum()
-        total_target = df_staff["sale_target"].sum()
-        total_rate = total_amount / total_target if total_target > 0 else 0
-        
-        today = datetime.now().strftime("%Y-%m-%d")
-        df_today = df_staff[df_staff["sale_date"] == today]
-        today_amount = df_today["sale_amount"].sum()
-        today_target = df_today["sale_target"].sum()
-        today_rate = today_amount / today_target if today_target > 0 else 0
-    else:
-        total_amount = total_target = total_rate = today_amount = today_target = today_rate = 0
-    
-    # 4. 核心指标看板
-    st.subheader("📊 核心销售指标")
+# ======================== 主页面（新增5个姓名录入项） ========================
+# 管理员和普通用户都能看到批量录入界面
+st.title("✈️ 航班销售批量录入系统")
+
+# 退出按钮
+col_logout, _ = st.columns([1, 9])
+with col_logout:
+    if st.button("🚪 退出登录"):
+        st.session_state.clear()
+        st.rerun()
+
+# 1. 公共筛选条件
+st.subheader("📅 公共录入条件")
+col1, col2 = st.columns(2)
+with col1:
+    sale_date = st.date_input("销售日期（统一）", datetime.now())
+with col2:
+    batch_note = st.text_input("录入备注（选填）", placeholder="如：2026年2月22日批量录入")
+
+# 2. 5个销售人员录入项
+st.subheader("👥 销售人员销售数据录入（共5项）")
+sales_data_list = []
+
+# 循环生成5个录入项
+for i, staff_label in enumerate(SALES_STAFF_ITEMS):
+    st.markdown(f"### {staff_label}")
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.metric("今日销售额", format_amount(today_amount))
+        staff_name = st.text_input(f"{staff_label} 姓名", key=f"staff_name_{i}", placeholder="请填写真实姓名")
     with col2:
-        st.metric("今日完成率", format_rate(today_rate))
+        flight_no = st.text_input(f"{staff_label} 航班号", key=f"flight_no_{i}", placeholder="如：MU1234、CA5678")
     with col3:
-        st.metric("筛选期总销售额", format_amount(total_amount))
+        sale_amount = st.number_input(f"{staff_label} 销售额（元）", key=f"sale_amount_{i}", min_value=0.0, step=0.01)
     with col4:
-        st.metric("筛选期完成率", format_rate(total_rate))
+        sale_target = st.number_input(f"{staff_label} 销售指标（元）", key=f"sale_target_{i}", min_value=0.0, step=0.01)
     
-    # 5. 录入航班销售数据
-    st.subheader("➕ 录入航班销售数据")
-    with st.form("add_sale_form", clear_on_submit=True):
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            sale_date = st.date_input("销售日期", datetime.now())
-        with col2:
-            flight_no = st.text_input("航班号", placeholder="如：MU1234、CA5678")
-        with col3:
-            sale_amount = st.number_input("销售额（元）", min_value=0.0, step=0.01)
-        with col4:
-            sale_target = st.number_input("销售指标（元）", min_value=0.0, step=0.01)
-        
-        submit_btn = st.form_submit_button("提交数据", type="primary")
-        if submit_btn:
-            success, msg = add_flight_sale(
-                st.session_state.user["id"],
-                st.session_state.user["real_name"],
-                flight_no,
-                sale_date,
-                sale_amount,
-                sale_target
-            )
-            if success:
-                st.success(msg)
-                st.rerun()
-            else:
-                st.error(msg)
-    
-    # 6. 个人可视化图表
-    st.subheader("📈 个人销售数据可视化")
-    if not df_staff.empty:
-        tab1, tab2, tab3, tab4 = st.tabs(["完成率趋势", "航班TOP10", "月度趋势", "销售额vs指标"])
-        
-        with tab1:
-            fig_trend = plot_staff_completion_trend(df_staff)
-            if fig_trend:
-                st.pyplot(fig_trend)
-        
-        with tab2:
-            fig_flight_top10 = plot_staff_flight_top10(df_staff)
-            if fig_flight_top10:
-                st.pyplot(fig_flight_top10)
-        
-        with tab3:
-            fig_monthly = plot_monthly_sales_trend(df_staff, is_admin=False)
-            if fig_monthly:
-                st.pyplot(fig_monthly)
-        
-        with tab4:
-            fig_sales_vs_target = plot_sales_vs_target(df_staff)
-            if fig_sales_vs_target:
-                st.pyplot(fig_sales_vs_target)
-        
-        # 饼图
-        st.subheader("🥧 个人航班销售占比")
-        fig_pie = plot_flight_sales_pie(df_staff)
-        if fig_pie:
-            st.pyplot(fig_pie)
-    else:
-        st.info("暂无销售数据，录入后即可查看所有可视化图表")
-    
-    # 7. 个人销售记录
-    st.subheader("📋 销售记录列表")
-    if not df_staff.empty:
-        display_df = df_staff[["id", "sale_date", "flight_no", "sale_amount_formatted", "sale_target_formatted", "completion_rate_formatted"]]
-        display_df.columns = ["ID", "销售日期", "航班号", "销售额", "销售指标", "完成率"]
-        st.dataframe(display_df, use_container_width=True)
-        
-        # 删除功能
-        st.subheader("🗑️ 删除记录")
-        selected_id = st.selectbox("选择要删除的记录ID", df_staff["id"].tolist())
-        if st.button("删除选中记录"):
-            success, msg = delete_flight_sale(selected_id, st.session_state.user["id"])
-            if success:
-                st.success(msg)
-                st.rerun()
-            else:
-                st.error(msg)
-    else:
-        st.info("暂无销售记录，请先录入数据")
+    # 收集数据
+    sales_data_list.append({
+        "staff_name": staff_name,
+        "flight_no": flight_no,
+        "sale_date": sale_date,
+        "sale_amount": sale_amount,
+        "sale_target": sale_target
+    })
 
-# ======================== 管理员后台 ========================
-else:
-    st.title("🔧 航班销售管理后台")
-    
-    # 退出按钮
-    col_logout, _ = st.columns([1, 9])
-    with col_logout:
-        if st.button("🚪 退出登录"):
-            st.session_state.clear()
-            st.rerun()
-    
-    # 1. 全平台数据筛选
-    st.subheader("📅 全平台数据筛选")
-    col1, col2 = st.columns(2)
-    with col1:
-        start_date = st.date_input("开始日期", datetime.now() - timedelta(days=30))
-    with col2:
-        end_date = st.date_input("结束日期", datetime.now())
-    
-    # 2. 获取全平台数据
+# 3. 批量提交按钮
+submit_batch_btn = st.button("📤 批量提交所有数据", type="primary")
+if submit_batch_btn:
+    success, msg = add_batch_flight_sales(sales_data_list)
+    if success:
+        st.success(msg)
+    else:
+        st.error(msg)
+
+st.markdown("---")
+
+# 4. 数据看板（根据用户权限展示）
+st.subheader("📊 销售数据看板")
+
+# 时间筛选
+col1, col2 = st.columns(2)
+with col1:
+    start_date = st.date_input("看板开始日期", datetime.now() - timedelta(days=30))
+with col2:
+    end_date = st.date_input("看板结束日期", datetime.now())
+
+# 管理员查看全平台数据，普通用户查看个人数据
+if st.session_state.user["is_admin"]:
+    # 管理员看板
     df_all = get_all_staff_sales(start_date, end_date)
     ranking_df = get_staff_ranking(start_date, end_date)
     
     if not df_all.empty:
-        # 3. 全平台核心统计
+        # 核心统计
         total_amount = df_all["sale_amount"].sum()
         total_target = df_all["sale_target"].sum()
         total_rate = total_amount / total_target if total_target > 0 else 0
         staff_count = df_all["staff_name"].nunique()
         flight_count = df_all["flight_no"].nunique()
         
-        st.subheader("📊 全平台核心指标")
         col1, col2, col3, col4, col5 = st.columns(5)
         with col1:
             st.metric("总销售额", format_amount(total_amount))
@@ -748,39 +769,31 @@ else:
         with col5:
             st.metric("涉及航班数", flight_count)
         
-        # 4. 整体完成率仪表盘
-        st.subheader("🎯 整体完成率")
-        fig_gauge = plot_total_completion_gauge(total_rate)
-        if fig_gauge:
-            st.pyplot(fig_gauge)
-        
-        # 5. 全平台可视化图表
-        st.subheader("📈 全平台数据可视化")
-        tab1, tab2, tab3 = st.tabs(["月度销售趋势", "航班占比", "销售人员对比"])
+        # 可视化图表
+        st.subheader("📈 全平台可视化分析")
+        tab1, tab2, tab3 = st.tabs(["月度趋势", "航班占比", "销售排名"])
         
         with tab1:
-            fig_admin_monthly = plot_monthly_sales_trend(df_all, is_admin=True)
-            if fig_admin_monthly:
-                st.pyplot(fig_admin_monthly)
+            fig_monthly = plot_monthly_sales_trend(df_all, is_admin=True)
+            if fig_monthly:
+                st.pyplot(fig_monthly)
         
         with tab2:
-            fig_admin_pie = plot_flight_sales_pie(df_all)
-            if fig_admin_pie:
-                st.pyplot(fig_admin_pie)
+            fig_pie = plot_flight_sales_pie(df_all)
+            if fig_pie:
+                st.pyplot(fig_pie)
         
         with tab3:
             fig_ranking = plot_staff_ranking(ranking_df)
             if fig_ranking:
                 st.pyplot(fig_ranking)
         
-        # 6. 排名表格
-        st.subheader("🏆 销售人员完成率排名")
+        # 排名表格
         display_ranking = ranking_df[["rank", "staff_name", "sale_amount_formatted", "sale_target_formatted", "completion_rate_formatted"]]
         display_ranking.columns = ["排名", "销售人员", "总销售额", "总指标", "完成率"]
         st.dataframe(display_ranking, use_container_width=True)
         
-        # 7. 数据导出
-        st.subheader("📥 数据导出")
+        # 数据导出
         export_df = df_all[["staff_name", "flight_no", "sale_date", "sale_amount", "sale_target", "completion_rate"]]
         export_df.columns = ["销售人员", "航班号", "销售日期", "销售额", "销售指标", "完成率"]
         export_df["销售额"] = export_df["销售额"].apply(format_amount)
@@ -788,23 +801,46 @@ else:
         export_df["完成率"] = export_df["完成率"].apply(format_rate)
         
         st.download_button(
-            label="导出Excel格式（CSV）",
+            label="📥 导出全平台数据（CSV）",
             data=export_df.to_csv(index=False, encoding='utf-8-sig'),
             file_name=f"航班销售数据_{datetime.now().strftime('%Y%m%d%H%M%S')}.csv",
             mime="text/csv"
         )
-        
-        # 8. 全平台详细数据
-        st.subheader("📋 全平台销售记录")
-        display_df = df_all[["staff_name", "flight_no", "sale_date", "sale_amount", "sale_target", "completion_rate"]]
-        display_df.columns = ["销售人员", "航班号", "销售日期", "销售额", "销售指标", "完成率"]
-        display_df["销售额"] = display_df["销售额"].apply(format_amount)
-        display_df["销售指标"] = display_df["销售指标"].apply(format_amount)
-        display_df["完成率"] = display_df["完成率"].apply(format_rate)
-        st.dataframe(display_df, use_container_width=True, height=400)
     else:
-        st.info("📭 全平台暂无销售数据，请先让销售人员录入数据")
+        st.info("暂无销售数据，请先录入")
+else:
+    # 普通用户看板
+    df_staff = get_staff_sales(st.session_state.user["id"], start_date, end_date)
+    
+    if not df_staff.empty:
+        total_amount = df_staff["sale_amount"].sum()
+        total_target = df_staff["sale_target"].sum()
+        total_rate = total_amount / total_target if total_target > 0 else 0
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("总销售额", format_amount(total_amount))
+        with col2:
+            st.metric("总销售指标", format_amount(total_target))
+        with col3:
+            st.metric("总完成率", format_rate(total_rate))
+        
+        # 个人可视化
+        st.subheader("📈 个人销售分析")
+        tab1, tab2 = st.tabs(["完成率趋势", "航班TOP10"])
+        
+        with tab1:
+            fig_trend = plot_staff_completion_trend(df_staff)
+            if fig_trend:
+                st.pyplot(fig_trend)
+        
+        with tab2:
+            fig_top10 = plot_staff_flight_top10(df_staff)
+            if fig_top10:
+                st.pyplot(fig_top10)
+    else:
+        st.info("暂无个人销售数据，请先录入")
 
 # 底部信息
 st.markdown("---")
-st.markdown("<div style='text-align:center; color:#666;'>航班销售管理系统 | 外网可访问 | 销售人员独立统计</div>", unsafe_allow_html=True)
+st.markdown("<div style='text-align:center; color:#666;'>航班销售管理系统 | 支持5人批量录入 | 自动计算完成率</div>", unsafe_allow_html=True)
