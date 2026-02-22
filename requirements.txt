@@ -1,3 +1,6 @@
 streamlit
 pandas
 werkzeug
+matplotlib
+seaborn
+numpy
